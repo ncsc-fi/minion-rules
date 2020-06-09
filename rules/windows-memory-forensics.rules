@@ -1,0 +1,190 @@
+###########################################################################
+# First steps for memory forensics on a Windows machine using Minion
+# - Get image file information for immutability checks etc.
+# - Get image info to be used with other tools
+# - Get process list with full paths
+# - Get process handles
+# - Get registry hivelist
+# - Get autoruns from Software\Microsoft\Windows\CurrentVersion\Run
+# - Get network connections (vol3 doesn't have windows netscan plugin yet)
+# 
+# - Mix em up into markdown
+
+
+###########################################################################
+###
+## File and image Info
+##
+#
+
+
+rule IN => file_attrs
+  ls --full-time $IN
+
+rule IN => md5
+  md5sum $IN
+
+rule IN => sha256
+  sha256sum $IN
+
+rule IN with file_attrs and sha256 and md5 => file_summary
+  echo '# File info ($IN)' >> $OUT
+  echo '## Attributes\n`$value(file_attrs)`' >> $OUT
+  echo '## MD5\n`$value(md5)`' >> $OUT
+  echo '## SHA256\n`$value(sha256)`' >> $OUT
+
+rule IN => imageinfo
+    docker run -v "$(pwd)/image/":/image:ro -v "$(pwd)/symbols/":/symbols/ cincan/volatility3:latest -s /symbols/ -r csv -f $IN windows.info
+
+### Summary ###
+rule IN with imageinfo => image_summary
+  echo '# Image info ($IN)' >> $OUT
+  echo '```' >> $OUT
+  cat $(imageinfo) >> $OUT
+  echo '```' >> $OUT
+
+
+###########################################################################
+###
+## Process listings and handles
+##
+#
+
+#### Output format:
+#"TreeDepth","PID","PPID","ImageFileName","Offset(V)","Threads","Handles","SessionId","Wow64","CreateTime","ExitTime"
+#0,4,0,"System","0x888293c13080",144,,,False,"2020-05-07 21:05:52.000000 ",
+#1,104,4,"Registry","0x888293c13080",4,,,False,"2020-05-07 21:05:42.000000 ",
+#1,104,4,"Registry","0x888293c13080",4,,,False,"2020-05-07 21:05:42.000000 ",
+#### /Output format
+rule IN => pslist
+    docker run -v "$(pwd)/image/":/image:ro -v "$(pwd)/symbols/":/symbols/ cincan/volatility3:latest -s /symbols/ -r csv -f $IN windows.pstree
+
+# this rule enables us to use GLOBAL:process_by_name/[name] as a map.
+rule pslist => process_by_name
+  mkdir -p $OUT
+  grep -P "^\d" $pslist | awk -F"," '{print $4 "," $0}' | linemux -k "[^,]+," -K -d $OUT
+
+
+### Summary ###
+rule pslist => process_summary
+  echo '# Process summary' >> $OUT
+  echo '## Process list' >> $OUT
+  echo '```' >> $OUT
+  cat $pslist >> $OUT
+  echo '```' >> $OUT
+
+#### The code below is for storing artifacts for later processing
+#### It's not relevant for a summary, but aggregating stuff from it
+#### will be interesting for the summary later on once we find something.
+
+rule IN => ps_cmd
+  docker run -v "$(pwd)/image/":/image:ro -v "$(pwd)/symbols/":/symbols/ cincan/volatility3:latest -s /symbols/ -r csv -f $IN windows.cmd
+
+# this rule enables us to use GLOBAL:process_by_pid/[pid] as a map.
+rule ps_cmd => process_by_pid
+  mkdir -p $OUT
+  grep -P "^\d" $ps_cmd | awk -F"," '{print $2 "," $0}' | linemux -k "[^,]+," -K -d $OUT
+
+
+
+#### Output format:
+# "TreeDepth","PID","Process","Offset","HandleValue","Type","GrantedAccess","Name"
+# 0,4,"System","0x88828aab1040","0x4","Process","0x1fffff","System Pid 4"
+# 0,4,"System","0x88828abc1140","0x8","Thread","0x1fffff","Tid 28 Pid 4"
+# 0,4,"System","0xcf04dd9f4070","0xc","Key","0x8","MACHINE\SYSTEM\CONTROLSET001\CONTROL\POWER\PROFILE\EVENTS\{54533251-82BE-4824-96C1-47B60B740D00}\{0AABB002-A307-447E-9B81-1D819DF6C6D0}\{CE74AA52-A71A-4036-BEEF-B6C411010E28}"
+# 0,4,"System","0x88828aa9da00","0x10","Mutant","0x1f0001","BcdSyncMutant"
+#### /Output format
+rule IN => all_handles
+  docker run -v "$(pwd)/image/":/image:ro -v "$(pwd)/symbols/":/symbols/ cincan/volatility3:latest -s /symbols/ -r csv -f $IN windows.handles
+
+## I change the filenames to contain both filename and pid to make it easier for human eyes to find suspect things
+## for example double processes or typos in filenames.
+#filename => RuntimeBroker._4020
+#filename => browser_broker_4600
+#filename => fontdrvhost.ex_844
+#filename => MicrosoftEdgeS_4928
+rule all_handles => handles_by_process_pid
+  mkdir -p $OUT
+  grep -P "^\d" $all_handles | awk -F',' '{ gsub("\"","", $3); print $3 "_" $2 "," $0 }'| linemux -k "[^,]+," -K -d $OUT
+
+
+rule handles_by_process_pid => handle_counts
+  (wc -l $handles_by_process_pid ; basename $handles_by_process_pid ) |  awk 'BEGIN { ORS=" " } { print $1 }' >> $OUT 
+  echo >> $OUT
+
+rule IN with handle_counts => handle_summary
+  echo "## Process handles:" >> $OUT
+  echo '```' >> $OUT
+  echo "<handlecount> <process_pid>" >> $OUT
+  cat $handle_counts | column -t >> $OUT
+  echo '```' >> $OUT
+
+###########################################################################
+###
+## Registry work, e.g. autoruns
+##
+#
+# Note: We are scanning all reg hives => both HKCU and HKLM are covered.
+# Interesting paths:
+# - Software\Microsoft\Windows\CurrentVersion\Run
+# - Software\Microsoft\Windows\CurrentVersion\RunOnce
+# - Software\Microsoft\Windows\CurrentVersion\RunOnceEx
+# - Software\Microsoft\Windows\CurrentVersion\RunServices
+# - Software\Microsoft\Windows\CurrentVersion\RunServicesOnce
+# - Software\Microsoft\Windows\CurrentVersion\Themes
+# - Software\Microsoft\Windows\CurrentVersion\Debug
+# - Environment
+
+rule IN => interesting_paths
+  echo "reg_Run,Software\\Microsoft\\Windows\\CurrentVersion\\Run" >> $OUT
+  echo "reg_RunOnce,Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce" >> $OUT
+  echo "reg_RunOnceEx,Software\\Microsoft\\Windows\\CurrentVersion\\RunOnceEx" >> $OUT
+  echo "reg_RunServices,Software\\Microsoft\\Windows\\CurrentVersion\\RunServices" >> $OUT
+  echo "reg_RunServicesOnce,Software\\Microsoft\\Windows\\CurrentVersion\\RunServicesOnce" >> $OUT
+  echo "reg_Themes,Software\\Microsoft\\Windows\\CurrentVersion\\Themes" >> $OUT
+  echo "reg_Debug,Software\\Microsoft\\Windows\\CurrentVersion\\Debug" >> $OUT
+  echo "reg_Environment,Environment" >> $OUT
+
+rule interesting_paths => reg_key
+  mkdir -p $OUT
+  cat $interesting_paths | linemux -k "[^,]+," -K -d $OUT
+
+rule IN => memory_file
+
+#### Output format:
+# Registry output from volatility3
+#"TreeDepth","Last Write Time","Hive Offset","Type","Key","Name","Data","Volatile"
+#0,,"0xcf04dd80f000","Key","?\Software\Microsoft\Windows\CurrentVersion\Themes",,,
+#0,"2020-02-10 21:04:26.000000 ","0xcf04e0fe8000","Key","ROOT\Software\Microsoft\Windows\CurrentVersion\Themes","History","",False
+#2,"2020-02-10 21:04:26.000000 ","0xcf04e0fe8000","REG_DWORD","ROOT\Software\Microsoft\Windows\CurrentVersion\Themes\History\Colors","ColorHistory0","12826368",False
+# to strip empty rows:
+# | awk -F',' '$7 != ""'
+#### /Output
+rule reg_key with GLOBAL:memory_file => reg_key_values
+  echo '### Registry path: `$value(reg_key)`' >> $OUT
+  echo '```' >> $OUT
+  docker run -v "$(pwd)/image/":/image:ro -v "$(pwd)/symbols/":/symbols/ cincan/volatility3:latest -s /symbols/ -r csv -f $memory_file windows.registry.printkey --key "$value(reg_key)" | awk -F ',' '$7 != ""' >> $OUT
+  echo '```' >> $OUT
+
+rule IN => registry_hives
+  docker run -v "$(pwd)/image/":/image:ro -v "$(pwd)/symbols/":/symbols/ cincan/volatility3:latest -s /symbols/ -r csv -f $IN windows.registry.hivelist
+
+### Summary ###
+rule IN with reg_key_values and registry_hives => reg_summary
+  echo '# Windows Registry' > $OUT
+  echo '## Registry hives with offset' >> $OUT
+  echo '```' >> $OUT
+  cat $registry_hives >> $OUT
+  echo '```' >> $OUT
+  echo '## Registry values' >> $OUT
+  cat $reg_key_values >> $OUT
+
+###########################################################################
+###
+## Report summary here
+##
+
+rule () with file_summary and image_summary and process_summary and handle_summary and reg_summary => summary.md --target
+  cat $file_summary $image_summary $process_summary $handle_summary $reg_summary
+
+# Go open summary.md
